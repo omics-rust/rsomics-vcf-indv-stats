@@ -17,11 +17,19 @@ chr1\t200\t.\tG\tC\t60\tPASS\t.\tGT:DP\t0/1:12\t1/1:18\t0/1:14\n\
 chr2\t100\t.\tC\tT\t55\tPASS\t.\tGT:DP\t0/0:10\t0/0:10\t0/1:20\n\
 ";
 
-/// Write the inline VCF bytes to a temp file in the KIOXIA tmp dir and return
-/// the path. Uses `std::env::temp_dir()` so CI uses the runner's TMPDIR.
+/// Write VCF bytes to a uniquely-named temp file and return the path.
+/// Each call produces a distinct name to avoid races between parallel tests.
 fn write_vcf(vcf: &str) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
     let dir = std::env::temp_dir();
-    let path = dir.join("rsomics_vcf_indv_stats_golden.vcf");
+    // Mix thread-id and nanosecond timestamp for a collision-resistant name.
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tid = std::thread::current().id();
+    let name = format!("rsomics_vcf_indv_stats_{tid:?}_{ts}.vcf");
+    let path = dir.join(name);
     let mut f = std::fs::File::create(&path).expect("cannot create temp VCF");
     f.write_all(vcf.as_bytes()).expect("write");
     path

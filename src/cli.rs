@@ -62,18 +62,29 @@ impl Cli {
                 }
             }
             Mode::Singletons => {
-                let singletons = run_singletons(path)?;
+                let scan = run_singletons(path)?;
+                // A polyploid site aborts vcftools with exit 1 after it has
+                // already written the header and every earlier row. Emit the
+                // partial table first, then fail loud so the exit code matches.
+                if let Some(site) = scan.abort {
+                    if !json {
+                        print!("{}", scan.singletons.to_text());
+                    }
+                    return Err(rsomics_common::RsomicsError::InvalidInput(format!(
+                        "Polyploidy found, and not supported by vcftools: {site}"
+                    )));
+                }
                 if json {
                     let env = serde_json::json!({
                         "schema_version": rsomics_common::SCHEMA_VERSION,
                         "tool": META.name,
                         "tool_version": META.version,
                         "status": "ok",
-                        "result": singletons,
+                        "result": scan.singletons,
                     });
                     println!("{}", serde_json::to_string(&env).unwrap_or_default());
                 } else {
-                    print!("{}", singletons.to_text());
+                    print!("{}", scan.singletons.to_text());
                 }
             }
             Mode::Depth => {

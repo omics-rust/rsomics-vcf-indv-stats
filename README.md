@@ -9,7 +9,7 @@ rsomics-vcf-indv-stats --mode <MODE> <VCF>
 
 Modes:
   tstv-summary   Substitution-type counts + Ts/Tv totals (.TsTv.summary)
-  singletons     Sites with 1 or 2 ALT allele copies (.singletons)
+  singletons     Private singletons (S) and private doubletons (D) per allele (.singletons)
   depth          Per-sample mean FORMAT/DP (.idepth)
 ```
 
@@ -18,6 +18,25 @@ Modes:
 ```
 cargo install rsomics-vcf-indv-stats
 ```
+
+## Boundaries
+
+Output is byte-identical to vcftools 0.1.17 for every well-formed, coordinate-sorted,
+equal-width VCF — including sites-only inputs, `POS=0`, missing/absent GT, half-calls,
+phased and haploid genotypes, and multiallelic sites — and matches vcftools' exit code
+and core stderr message on the common error cases (sites-only "Require Genotypes",
+polyploid abort).
+
+For genuinely malformed input, vcftools has undefined or buggy behaviour, so this crate
+does **not** attempt to reproduce it and is instead the deterministic reference:
+
+- **Ragged rows** — a data row with more (or fewer) sample columns than the `#CHROM`
+  line declares. The header-declared sample count is authoritative; extra columns are
+  ignored rather than indexed into a phantom sample.
+- **Malformed GT separators** — tokens such as `.//` that split into more than two
+  allele slots are treated as ploidy > 2 and abort like a polyploid site.
+- **Duplicate FORMAT keys** — a FORMAT such as `GT:GT` resolves to the first `GT`
+  slot; vcftools reads a different slot, so results differ.
 
 ## Origin
 

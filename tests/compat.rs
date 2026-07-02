@@ -1,14 +1,15 @@
 //! Value-exact compatibility with vcftools 0.1.17 per-individual statistics.
 //!
-//! All golden VCF content is hardcoded inline; no filesystem paths or external
-//! processes are required. A second section gates on vcftools being on PATH and
-//! diffs the live oracle output byte-for-byte.
+//! Every expected string is frozen from a live `vcftools 0.1.17 --singletons /
+//! --TsTv-summary / --depth` run captured once and pasted here as a constant.
+//! The tests never spawn vcftools, Python, or any external process; they only
+//! write a tiny VCF to the process temp dir and read it back through the crate.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
-/// Three-sample VCF used for all three mode tests.
+/// Three-sample VCF used for the TsTv/depth mode tests and the baseline
+/// singletons case.
 const GOLDEN_VCF: &str = "\
 ##fileformat=VCFv4.1\n\
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1\tSample2\tSample3\n\
@@ -17,12 +18,49 @@ chr1\t200\t.\tG\tC\t60\tPASS\t.\tGT:DP\t0/1:12\t1/1:18\t0/1:14\n\
 chr2\t100\t.\tC\tT\t55\tPASS\t.\tGT:DP\t0/0:10\t0/0:10\t0/1:20\n\
 ";
 
-/// Write VCF bytes to a uniquely-named temp file and return the path.
-/// Each call produces a distinct name to avoid races between parallel tests.
+/// Every singleton/doubleton edge in one file: spread doubleton (no row),
+/// private doubleton, REF singleton, ALT singleton, half-call carrying ALT,
+/// half-call carrying REF, phased, haploid spread doubleton (no row → REF
+/// singleton), multiallelic double singleton, monomorphic, all-missing, indel,
+/// symbolic ALT.
+const EDGES_VCF: &str = "\
+##fileformat=VCFv4.1\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\n\
+chr1\t10\t.\tA\tT\t.\t.\t.\tGT\t0/1\t0/1\t0/0\n\
+chr1\t20\t.\tA\tT\t.\t.\t.\tGT\t1/1\t0/0\t0/0\n\
+chr1\t30\t.\tA\tT\t.\t.\t.\tGT\t1/1\t1/1\t0/1\n\
+chr1\t40\t.\tA\tT\t.\t.\t.\tGT\t0/0\t0/0\t0/1\n\
+chr1\t50\t.\tA\tT\t.\t.\t.\tGT\t0/0\t0/0\t./1\n\
+chr1\t60\t.\tA\tT\t.\t.\t.\tGT\t1/1\t1/1\t0/.\n\
+chr1\t70\t.\tA\tT\t.\t.\t.\tGT\t0|0\t0|0\t0|1\n\
+chr1\t80\t.\tA\tT\t.\t.\t.\tGT\t1\t1\t0\n\
+chr1\t90\t.\tA\tT,G\t.\t.\t.\tGT\t0/0\t0/1\t0/2\n\
+chr1\t100\t.\tA\tT\t.\t.\t.\tGT\t0/0\t0/0\t0/0\n\
+chr1\t110\t.\tA\tT\t.\t.\t.\tGT\t./.\t./.\t./.\n\
+chr2\t5\t.\tAC\tA\t.\t.\t.\tGT\t0/0\t0/0\t0/1\n\
+chr2\t15\t.\tA\t<DEL>\t.\t.\t.\tGT\t0/0\t0/0\t0/1\n\
+";
+
+/// One sample, heterozygous 0/1: both REF and ALT have count one, so vcftools
+/// emits a singleton row for each.
+const SINGLE_SAMPLE_VCF: &str = "\
+##fileformat=VCFv4.1\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tONLY\n\
+chr1\t100\t.\tA\tT\t.\t.\t.\tGT\t0/1\n\
+";
+
+/// A polyploid genotype at a site — vcftools aborts with a hard error.
+const POLYPLOID_VCF: &str = "\
+##fileformat=VCFv4.1\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\n\
+chr1\t100\t.\tA\tT\t.\t.\t.\tGT\t0/1\t0/0/0\t0/0\n\
+";
+
+/// Write VCF bytes to a uniquely-named temp file and return the path. Each call
+/// produces a distinct name to avoid races between parallel tests.
 fn write_vcf(vcf: &str) -> PathBuf {
     use std::time::{SystemTime, UNIX_EPOCH};
     let dir = std::env::temp_dir();
-    // Mix thread-id and nanosecond timestamp for a collision-resistant name.
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
@@ -35,7 +73,7 @@ fn write_vcf(vcf: &str) -> PathBuf {
     path
 }
 
-// ── Expected outputs frozen from vcftools 0.1.17 black-box ───────────────────
+// ── Expected outputs frozen from vcftools 0.1.17 ─────────────────────────────
 
 const EXPECTED_TSTV: &str = "\
 MODEL\tCOUNT\n\
@@ -54,6 +92,27 @@ CHROM\tPOS\tSINGLETON/DOUBLETON\tALLELE\tINDV\n\
 chr2\t100\tS\tT\tSample3\n\
 ";
 
+const EXPECTED_EDGES: &str = "\
+CHROM\tPOS\tSINGLETON/DOUBLETON\tALLELE\tINDV\n\
+chr1\t20\tD\tT\tS1\n\
+chr1\t30\tS\tA\tS3\n\
+chr1\t40\tS\tT\tS3\n\
+chr1\t50\tS\tT\tS3\n\
+chr1\t60\tS\tA\tS3\n\
+chr1\t70\tS\tT\tS3\n\
+chr1\t80\tS\tA\tS3\n\
+chr1\t90\tS\tT\tS2\n\
+chr1\t90\tS\tG\tS3\n\
+chr2\t5\tS\tA\tS3\n\
+chr2\t15\tS\t<DEL>\tS3\n\
+";
+
+const EXPECTED_SINGLE_SAMPLE: &str = "\
+CHROM\tPOS\tSINGLETON/DOUBLETON\tALLELE\tINDV\n\
+chr1\t100\tS\tA\tONLY\n\
+chr1\t100\tS\tT\tONLY\n\
+";
+
 const EXPECTED_DEPTH: &str = "\
 INDV\tN_SITES\tMEAN_DEPTH\n\
 Sample1\t3\t10.6667\n\
@@ -61,7 +120,7 @@ Sample2\t3\t14.3333\n\
 Sample3\t3\t18\n\
 ";
 
-// ── Unit assertions against hardcoded expected strings ────────────────────────
+// ── Assertions against the frozen vcftools 0.1.17 output ─────────────────────
 
 #[test]
 fn tstv_summary_matches_expected() {
@@ -71,10 +130,171 @@ fn tstv_summary_matches_expected() {
 }
 
 #[test]
-fn singletons_matches_expected() {
+fn singletons_baseline_matches_expected() {
     let path = write_vcf(GOLDEN_VCF);
-    let singletons = rsomics_vcf_indv_stats::run_singletons(&path).unwrap();
-    assert_eq!(singletons.to_text(), EXPECTED_SINGLETONS);
+    let scan = rsomics_vcf_indv_stats::run_singletons(&path).unwrap();
+    assert!(scan.abort.is_none());
+    assert_eq!(scan.singletons.to_text(), EXPECTED_SINGLETONS);
+}
+
+#[test]
+fn singletons_edges_match_expected() {
+    let path = write_vcf(EDGES_VCF);
+    let scan = rsomics_vcf_indv_stats::run_singletons(&path).unwrap();
+    assert!(scan.abort.is_none());
+    assert_eq!(scan.singletons.to_text(), EXPECTED_EDGES);
+}
+
+#[test]
+fn singletons_single_sample_matches_expected() {
+    let path = write_vcf(SINGLE_SAMPLE_VCF);
+    let scan = rsomics_vcf_indv_stats::run_singletons(&path).unwrap();
+    assert!(scan.abort.is_none());
+    assert_eq!(scan.singletons.to_text(), EXPECTED_SINGLE_SAMPLE);
+}
+
+#[test]
+fn singletons_small_frequency_matches_expected() {
+    // 200 samples, one heterozygous ALT carrier → a single ALT singleton row.
+    let mut vcf =
+        String::from("##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT");
+    for i in 0..200 {
+        vcf.push_str(&format!("\tN{i}"));
+    }
+    vcf.push_str("\nchr1\t100\t.\tA\tT\t.\t.\t.\tGT");
+    for i in 0..200 {
+        vcf.push_str(if i == 199 { "\t0/1" } else { "\t0/0" });
+    }
+    vcf.push('\n');
+    let path = write_vcf(&vcf);
+    let scan = rsomics_vcf_indv_stats::run_singletons(&path).unwrap();
+    assert!(scan.abort.is_none());
+    assert_eq!(
+        scan.singletons.to_text(),
+        "CHROM\tPOS\tSINGLETON/DOUBLETON\tALLELE\tINDV\nchr1\t100\tS\tT\tN199\n",
+    );
+}
+
+#[test]
+fn singletons_polyploid_is_rejected() {
+    // vcftools aborts a --singletons run when a genotype has ploidy > 2, but
+    // only after writing a header-only file (the polyploid is the first site).
+    let path = write_vcf(POLYPLOID_VCF);
+    let scan = rsomics_vcf_indv_stats::run_singletons(&path).unwrap();
+    assert_eq!(scan.abort.as_deref(), Some("chr1:100"));
+    assert_eq!(
+        scan.singletons.to_text(),
+        "CHROM\tPOS\tSINGLETON/DOUBLETON\tALLELE\tINDV\n",
+    );
+}
+
+/// Lowercase REF/ALT and mixed-case symbolic alleles — vcftools uppercases the
+/// emitted ALLELE column universally (`a`→`A`, `<del>`→`<DEL>`).
+const LOWERCASE_VCF: &str = "\
+##fileformat=VCFv4.1\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\n\
+1\t100\t.\tacgt\ta\t.\t.\t.\tGT\t0/0\t0/0\t0/1\n\
+1\t200\t.\tn\ta\t.\t.\t.\tGT\t0/0\t0/0\t0/1\n\
+1\t300\t.\tA\t<del>\t.\t.\t.\tGT\t0/0\t0/0\t0/1\n\
+1\t500\t.\tc\tA\t.\t.\t.\tGT\t1/1\t0/0\t0/0\n\
+";
+
+const EXPECTED_LOWERCASE: &str = "\
+CHROM\tPOS\tSINGLETON/DOUBLETON\tALLELE\tINDV\n\
+1\t100\tS\tA\tS3\n\
+1\t200\tS\tA\tS3\n\
+1\t300\tS\t<DEL>\tS3\n\
+1\t500\tD\tA\tS1\n\
+";
+
+#[test]
+fn singletons_alleles_are_uppercased() {
+    let path = write_vcf(LOWERCASE_VCF);
+    let scan = rsomics_vcf_indv_stats::run_singletons(&path).unwrap();
+    assert!(scan.abort.is_none());
+    assert_eq!(scan.singletons.to_text(), EXPECTED_LOWERCASE);
+}
+
+/// A polyploid site preceded by real singleton rows: vcftools emits every row
+/// before the offending site, then aborts. Frozen from vcftools 0.1.17.
+const POLYPLOID_AFTER_ROWS_VCF: &str = "\
+##fileformat=VCFv4.1\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n\
+1\t100\t.\ta\tt\t.\t.\t.\tGT\t0/1\t0/0\n\
+1\t200\t.\tA\tG\t.\t.\t.\tGT\t0/0/1\t0/0\n\
+";
+
+#[test]
+fn singletons_polyploid_emits_preceding_rows() {
+    let path = write_vcf(POLYPLOID_AFTER_ROWS_VCF);
+    let scan = rsomics_vcf_indv_stats::run_singletons(&path).unwrap();
+    assert_eq!(scan.abort.as_deref(), Some("1:200"));
+    assert_eq!(
+        scan.singletons.to_text(),
+        "CHROM\tPOS\tSINGLETON/DOUBLETON\tALLELE\tINDV\n1\t100\tS\tT\tS1\n",
+    );
+}
+
+/// FORMAT places GT after DP, so the genotype must be located by name, not by
+/// taking the first colon-subfield. Frozen from vcftools 0.1.17.
+const GT_NOT_FIRST_VCF: &str = "\
+##fileformat=VCFv4.1\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\n\
+chr1\t100\t.\tA\tT\t.\t.\t.\tDP:GT\t10:0/0\t15:0/1\t20:0/0\n\
+chr1\t200\t.\tG\tC\t.\t.\t.\tDP:GT\t12:0/0\t18:0/0\t14:0/1\n\
+";
+
+const EXPECTED_GT_NOT_FIRST: &str = "\
+CHROM\tPOS\tSINGLETON/DOUBLETON\tALLELE\tINDV\n\
+chr1\t100\tS\tT\tS2\n\
+chr1\t200\tS\tC\tS3\n\
+";
+
+#[test]
+fn singletons_gt_located_by_name_not_first_subfield() {
+    let path = write_vcf(GT_NOT_FIRST_VCF);
+    let scan = rsomics_vcf_indv_stats::run_singletons(&path).unwrap();
+    assert!(scan.abort.is_none());
+    assert_eq!(scan.singletons.to_text(), EXPECTED_GT_NOT_FIRST);
+}
+
+/// FORMAT carries no GT key though sample columns exist. vcftools keeps the 3
+/// individuals but emits a header-only table — no site has genotype data.
+const GT_ABSENT_VCF: &str = "\
+##fileformat=VCFv4.1\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\n\
+chr1\t100\t.\tA\tT\t.\t.\t.\tDP\t1\t1\t1\n\
+chr1\t200\t.\tG\tC\t.\t.\t.\tDP\t5\t0\t2\n\
+";
+
+#[test]
+fn singletons_format_without_gt_emits_header_only() {
+    let path = write_vcf(GT_ABSENT_VCF);
+    let scan = rsomics_vcf_indv_stats::run_singletons(&path).unwrap();
+    assert!(scan.abort.is_none());
+    assert_eq!(
+        scan.singletons.to_text(),
+        "CHROM\tPOS\tSINGLETON/DOUBLETON\tALLELE\tINDV\n",
+    );
+}
+
+/// A sites-only VCF (no genotype columns) makes vcftools exit 1 with a fixed
+/// "Require Genotypes" message before reading any data.
+const SITES_ONLY_VCF: &str = "\
+##fileformat=VCFv4.1\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+chr1\t100\t.\tA\tT\t.\t.\t.\n\
+";
+
+#[test]
+fn singletons_sites_only_requires_genotypes() {
+    let path = write_vcf(SITES_ONLY_VCF);
+    let err = rsomics_vcf_indv_stats::run_singletons(&path).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Require Genotypes in VCF file in order to output Singletons."),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -82,117 +302,4 @@ fn depth_matches_expected() {
     let path = write_vcf(GOLDEN_VCF);
     let table = rsomics_vcf_indv_stats::run_depth(&path).unwrap();
     assert_eq!(table.to_text(), EXPECTED_DEPTH);
-}
-
-// ── Live vcftools oracle (skipped when vcftools not installed or wrong version)
-
-fn vcftools_version() -> Option<String> {
-    let out = Command::new("vcftools").arg("--version").output().ok()?;
-    // vcftools prints version to stdout or stderr depending on build; check both.
-    let combined =
-        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
-    combined.lines().next().map(str::to_string)
-}
-
-fn skip_unless_vcftools_017() -> Option<()> {
-    let ver = vcftools_version()?;
-    if !ver.contains("0.1.17") {
-        return None;
-    }
-    Some(())
-}
-
-/// Run vcftools with `--TsTv-summary` on a temp VCF and return the table text.
-fn oracle_tstv(vcf: &Path) -> Option<String> {
-    let out_dir = std::env::temp_dir();
-    let prefix = out_dir.join("rsomics_vcf_indv_stats_oracle");
-    let status = Command::new("vcftools")
-        .args([
-            "--vcf",
-            vcf.to_str()?,
-            "--TsTv-summary",
-            "--out",
-            prefix.to_str()?,
-        ])
-        .status()
-        .ok()?;
-    if !status.success() {
-        return None;
-    }
-    let summary = prefix.with_extension("TsTv.summary");
-    std::fs::read_to_string(summary).ok()
-}
-
-fn oracle_singletons(vcf: &Path) -> Option<String> {
-    let out_dir = std::env::temp_dir();
-    let prefix = out_dir.join("rsomics_vcf_indv_stats_oracle");
-    let status = Command::new("vcftools")
-        .args([
-            "--vcf",
-            vcf.to_str()?,
-            "--singletons",
-            "--out",
-            prefix.to_str()?,
-        ])
-        .status()
-        .ok()?;
-    if !status.success() {
-        return None;
-    }
-    let singletons = prefix.with_extension("singletons");
-    std::fs::read_to_string(singletons).ok()
-}
-
-fn oracle_depth(vcf: &Path) -> Option<String> {
-    let out_dir = std::env::temp_dir();
-    let prefix = out_dir.join("rsomics_vcf_indv_stats_oracle");
-    let status = Command::new("vcftools")
-        .args(["--vcf", vcf.to_str()?, "--depth", "--out", prefix.to_str()?])
-        .status()
-        .ok()?;
-    if !status.success() {
-        return None;
-    }
-    let depth = prefix.with_extension("idepth");
-    std::fs::read_to_string(depth).ok()
-}
-
-#[test]
-fn live_oracle_tstv_summary() {
-    if skip_unless_vcftools_017().is_none() {
-        eprintln!("vcftools 0.1.17 not found — skipping live oracle TsTv test");
-        return;
-    }
-    let path = write_vcf(GOLDEN_VCF);
-    let oracle = oracle_tstv(&path).expect("vcftools --TsTv-summary failed");
-    let stats = rsomics_vcf_indv_stats::run_tstv_summary(&path).unwrap();
-    assert_eq!(stats.to_text(), oracle, "TsTv-summary differs from oracle");
-}
-
-#[test]
-fn live_oracle_singletons() {
-    if skip_unless_vcftools_017().is_none() {
-        eprintln!("vcftools 0.1.17 not found — skipping live oracle singletons test");
-        return;
-    }
-    let path = write_vcf(GOLDEN_VCF);
-    let oracle = oracle_singletons(&path).expect("vcftools --singletons failed");
-    let singletons = rsomics_vcf_indv_stats::run_singletons(&path).unwrap();
-    assert_eq!(
-        singletons.to_text(),
-        oracle,
-        "singletons differs from oracle"
-    );
-}
-
-#[test]
-fn live_oracle_depth() {
-    if skip_unless_vcftools_017().is_none() {
-        eprintln!("vcftools 0.1.17 not found — skipping live oracle depth test");
-        return;
-    }
-    let path = write_vcf(GOLDEN_VCF);
-    let oracle = oracle_depth(&path).expect("vcftools --depth failed");
-    let table = rsomics_vcf_indv_stats::run_depth(&path).unwrap();
-    assert_eq!(table.to_text(), oracle, "depth differs from oracle");
 }

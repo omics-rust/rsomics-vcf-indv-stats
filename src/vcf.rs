@@ -12,7 +12,8 @@ use flate2::read::MultiGzDecoder;
 use rsomics_common::{Result, RsomicsError};
 
 use crate::{
-    DepthTable, SampleDepth, SingletonKind, SingletonRow, Singletons, TsTvSummary, classify_snp,
+    DepthTable, SampleDepth, SingletonKind, SingletonRow, SingletonScan, Singletons, TsTvSummary,
+    classify_snp,
 };
 
 // ── I/O helper ───────────────────────────────────────────────────────────────
@@ -37,6 +38,14 @@ fn open_reader(path: &Path) -> Result<Box<dyn Read>> {
 
 fn missing_chrom_err() -> rsomics_common::RsomicsError {
     RsomicsError::InvalidInput("VCF missing #CHROM header line".into())
+}
+
+/// vcftools refuses `--singletons` on a genotype-less VCF (0 individuals),
+/// exiting 1 with this exact core message.
+fn require_genotypes_err() -> rsomics_common::RsomicsError {
+    RsomicsError::InvalidInput(
+        "Require Genotypes in VCF file in order to output Singletons.".into(),
+    )
 }
 
 // ── Column indices (0-based after splitting on TAB) ──────────────────────────
@@ -110,54 +119,48 @@ pub fn scan_tstv(path: &Path) -> Result<TsTvSummary> {
 
 // ── Singletons ───────────────────────────────────────────────────────────────
 
-/// Count how many times each ALT allele index appears across all samples and
-/// collect which samples carry it. Returns `(total_count, carriers)` per ALT.
-///
-/// `carriers[i]` = list of sample indices that carry at least one copy of
-/// `ALT[i]` (0-based ALT index). `total[i]` = total allele copies.
-fn count_alt_alleles(gt_fields: &[&str]) -> (Vec<u32>, Vec<Vec<usize>>) {
-    // We don't know the ALT count ahead of time; size on demand.
-    let mut totals: Vec<u32> = Vec::new();
-    let mut carriers: Vec<Vec<usize>> = Vec::new();
+/// A diploid genotype call as vcftools stores it: two allele slots, each an
+/// allele index or `-1` for a missing/absent copy. Haploid `1` → `(1, -1)`,
+/// half-call `0/.` → `(0, -1)`, missing `./.` → `(-1, -1)`.
+type GtPair = (i64, i64);
 
-    for (sample_idx, field) in gt_fields.iter().enumerate() {
-        let gt = if let Some(colon) = field.find(':') {
-            &field[..colon]
-        } else {
-            field
-        };
-        // Genotype alleles separated by '/' or '|'; skip missing '.'.
-        let alleles: Vec<&str> = gt.split(['/', '|']).collect();
-        for a in alleles {
-            if a == "." {
-                continue;
-            }
-            let idx: usize = match a.parse::<usize>() {
-                Ok(v) if v > 0 => v - 1, // 0-based ALT index
-                _ => continue,
-            };
-            // Extend vecs if needed.
-            while totals.len() <= idx {
-                totals.push(0);
-                carriers.push(Vec::new());
-            }
-            totals[idx] += 1;
-            let c = &mut carriers[idx];
-            if c.last() != Some(&sample_idx) {
-                c.push(sample_idx);
-            }
-        }
+/// Parse a sample column's GT subfield into a `GtPair`. `gt_idx` is the GT
+/// slot's position within the colon-delimited FORMAT; a sample lacking that
+/// many subfields is treated as missing.
+///
+/// `Err` is reserved for ploidy > 2, which vcftools rejects outright
+/// ("Polyploidy found, and not supported by vcftools").
+fn parse_gt_pair(field: &str, gt_idx: usize) -> std::result::Result<GtPair, ()> {
+    let gt = field.split(':').nth(gt_idx).unwrap_or(".");
+    let mut alleles = gt.split(['/', '|']);
+    let first = alleles.next();
+    let second = alleles.next();
+    if alleles.next().is_some() {
+        return Err(());
     }
-    (totals, carriers)
+    let parse = |tok: Option<&str>| -> i64 {
+        match tok {
+            Some(t) if t != "." => t.parse::<i64>().unwrap_or(-1),
+            _ => -1,
+        }
+    };
+    Ok((parse(first), parse(second)))
 }
 
 /// Scan one VCF and collect singleton/doubleton rows.
-pub fn scan_singletons(path: &Path) -> Result<Singletons> {
+///
+/// For every allele index at a site — `0` = REF, `i` = the *i*-th ALT — whose
+/// total non-missing copy count across all samples is exactly one or two,
+/// vcftools emits a row: `S` for a single carrier, `D` only when both copies of
+/// a doubleton sit in one homozygous individual. A doubleton split across two
+/// carriers produces no row.
+pub fn scan_singletons(path: &Path) -> Result<SingletonScan> {
     let reader = open_reader(path)?;
     let mut lines_iter = BufReader::new(reader).lines();
     let mut singletons = Singletons::default();
     let mut sample_names: Vec<String> = Vec::new();
     let mut found_chrom = false;
+    let mut abort: Option<String> = None;
 
     for line in lines_iter.by_ref() {
         let line = line?;
@@ -168,51 +171,98 @@ pub fn scan_singletons(path: &Path) -> Result<Singletons> {
         if line.starts_with('#') {
             found_chrom = true;
             let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() <= FIRST_SAMPLE {
+                return Err(require_genotypes_err());
+            }
             sample_names = cols[FIRST_SAMPLE..].iter().map(|s| s.to_string()).collect();
             continue;
         }
         if !found_chrom {
             return Err(missing_chrom_err());
         }
-        if sample_names.is_empty() {
-            continue;
-        }
         let cols = split_cols(line);
-        if cols.len() < FIRST_SAMPLE {
+        if cols.len() <= COL_FORMAT {
             continue;
         }
-        let chrom = cols[COL_CHROM].to_string();
+        // The GT slot's position inside FORMAT is per-site; a FORMAT without a
+        // GT key carries no genotype data, so the whole site emits no rows.
+        let gt_idx = match cols[COL_FORMAT].split(':').position(|k| k == "GT") {
+            Some(i) => i,
+            None => continue,
+        };
+        let chrom = cols[COL_CHROM];
         let pos: u64 = cols[COL_POS].parse().unwrap_or(0);
+        let ref_col = cols[COL_REF];
         let alt_col = cols[COL_ALT];
-        let alts: Vec<&str> = alt_col.split(',').collect();
-        let gt_fields = &cols[FIRST_SAMPLE..];
 
-        let (totals, carriers) = count_alt_alleles(gt_fields);
+        // Allele strings in vcftools index order: 0 = REF, then each ALT.
+        let mut alleles: Vec<&str> = Vec::with_capacity(1 + alt_col.len());
+        alleles.push(ref_col);
+        if alt_col != "." {
+            alleles.extend(alt_col.split(','));
+        }
+        let n_alleles = alleles.len();
 
-        for (alt_idx, (&total, carrier_list)) in totals.iter().zip(carriers.iter()).enumerate() {
-            let kind = match total {
-                1 => SingletonKind::S,
-                2 => SingletonKind::D,
+        // vcftools reads every genotype for a site before emitting rows, so a
+        // polyploid call aborts the whole site (no row for it) and terminates
+        // the scan; rows from earlier sites have already been written.
+        // The #CHROM header declares the sample count; a data row that carries
+        // extra columns (ragged input) is truncated to that width so a sample
+        // index can never outrun `sample_names`.
+        let mut gts: Vec<GtPair> = Vec::with_capacity(sample_names.len());
+        for field in cols[FIRST_SAMPLE..].iter().take(sample_names.len()) {
+            match parse_gt_pair(field, gt_idx) {
+                Ok(p) => gts.push(p),
+                Err(()) => {
+                    abort = Some(format!("{chrom}:{pos}"));
+                    break;
+                }
+            }
+        }
+        if abort.is_some() {
+            break;
+        }
+
+        let mut counts = vec![0u32; n_alleles];
+        for &(a0, a1) in &gts {
+            for a in [a0, a1] {
+                if a >= 0 && (a as usize) < n_alleles {
+                    counts[a as usize] += 1;
+                }
+            }
+        }
+
+        for ui in 0..n_alleles {
+            let (kind, indv) = match counts[ui] {
+                1 => {
+                    let idx = gts
+                        .iter()
+                        .position(|&(a0, a1)| a0 == ui as i64 || a1 == ui as i64);
+                    (SingletonKind::S, idx)
+                }
+                2 => {
+                    let idx = gts
+                        .iter()
+                        .position(|&(a0, a1)| a0 == ui as i64 && a1 == ui as i64);
+                    (SingletonKind::D, idx)
+                }
                 _ => continue,
             };
-            let allele = alts.get(alt_idx).copied().unwrap_or(".").to_string();
-            for &sample_idx in carrier_list {
-                let indv = sample_names.get(sample_idx).cloned().unwrap_or_default();
-                singletons.rows.push(SingletonRow {
-                    chrom: chrom.clone(),
-                    pos,
-                    kind,
-                    allele: allele.clone(),
-                    indv,
-                });
-            }
+            let Some(sample_idx) = indv else { continue };
+            singletons.rows.push(SingletonRow {
+                chrom: chrom.to_string(),
+                pos,
+                kind,
+                allele: alleles[ui].to_ascii_uppercase(),
+                indv: sample_names[sample_idx].clone(),
+            });
         }
     }
 
     if !found_chrom {
         return Err(missing_chrom_err());
     }
-    Ok(singletons)
+    Ok(SingletonScan { singletons, abort })
 }
 
 // ── Depth ─────────────────────────────────────────────────────────────────────

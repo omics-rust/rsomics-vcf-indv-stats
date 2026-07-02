@@ -108,6 +108,15 @@ pub struct Singletons {
     pub rows: Vec<SingletonRow>,
 }
 
+/// Result of a singletons scan. `abort` carries the `CHROM:POS` of a
+/// polyploid site: vcftools writes every row found before that site, then dies
+/// with exit 1, so the rows collected so far are still valid output.
+#[derive(Debug, Default, Clone)]
+pub struct SingletonScan {
+    pub singletons: Singletons,
+    pub abort: Option<String>,
+}
+
 impl Singletons {
     /// Render as the `.singletons` table vcftools emits.
     #[must_use]
@@ -191,7 +200,7 @@ pub fn run_tstv_summary(path: &Path) -> Result<TsTvSummary> {
     vcf::scan_tstv(path)
 }
 
-pub fn run_singletons(path: &Path) -> Result<Singletons> {
+pub fn run_singletons(path: &Path) -> Result<SingletonScan> {
     vcf::scan_singletons(path)
 }
 

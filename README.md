@@ -22,10 +22,21 @@ cargo install rsomics-vcf-indv-stats
 ## Boundaries
 
 Output is byte-identical to vcftools 0.1.17 for every well-formed, coordinate-sorted,
-equal-width VCF — including sites-only inputs, `POS=0`, missing/absent GT, half-calls,
-phased and haploid genotypes, and multiallelic sites — and matches vcftools' exit code
-and core stderr message on the common error cases (sites-only "Require Genotypes",
-polyploid abort).
+equal-width VCF — including `POS=0`, missing/absent GT, half-calls, phased and haploid
+genotypes, multiallelic sites, lowercase/soft-masked REF/ALT bases (folded before the
+ACGT gate, as vcftools does), non-integer FORMAT/DP (read with `atoi`: `10.5` → `10`),
+and samples covered at zero sites (mean printed as `nan`).
+
+It matches vcftools' exit code and core stderr message on the shared error cases:
+
+- **Genotype-less `--singletons` or `--depth`** — a sites-only VCF (no sample columns),
+  or a `#CHROM` line carrying a FORMAT column but zero samples, exits 1 with the
+  respective "Require Genotypes in VCF file in order to output …" message.
+- **Polyploid abort** — a genotype of ploidy > 2 in `--singletons` prints every row
+  found before the offending site, then exits 1.
+
+(`--TsTv-summary` needs no genotypes, so a sites-only VCF is valid input there and
+produces a normal — possibly all-zero — table.)
 
 For genuinely malformed input, vcftools has undefined or buggy behaviour, so this crate
 does **not** attempt to reproduce it and is instead the deterministic reference:

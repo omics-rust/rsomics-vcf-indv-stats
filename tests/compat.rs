@@ -303,3 +303,136 @@ fn depth_matches_expected() {
     let table = rsomics_vcf_indv_stats::run_depth(&path).unwrap();
     assert_eq!(table.to_text(), EXPECTED_DEPTH);
 }
+
+/// A sites-only VCF (8-column header, no FORMAT/samples) makes vcftools exit 1
+/// with "...output Individuals by Mean Depth Statistics." — the depth analogue
+/// of the singletons Require-Genotypes guard.
+const DEPTH_SITES_ONLY_VCF: &str = "\
+##fileformat=VCFv4.1\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+chr1\t100\t.\tA\tT\t.\t.\t.\n\
+";
+
+/// A 9-column header (FORMAT present, zero sample columns) is likewise a
+/// genotype-less file; vcftools exits 1 with the same message.
+const DEPTH_ZERO_SAMPLE_VCF: &str = "\
+##fileformat=VCFv4.1\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\n\
+chr1\t100\t.\tA\tT\t.\t.\t.\tGT:DP\n\
+";
+
+const DEPTH_REQUIRE_GT_MSG: &str =
+    "Require Genotypes in VCF file in order to output Individuals by Mean Depth Statistics.";
+
+#[test]
+fn depth_sites_only_requires_genotypes() {
+    let path = write_vcf(DEPTH_SITES_ONLY_VCF);
+    let err = rsomics_vcf_indv_stats::run_depth(&path).unwrap_err();
+    assert!(
+        err.to_string().contains(DEPTH_REQUIRE_GT_MSG),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn depth_zero_sample_requires_genotypes() {
+    let path = write_vcf(DEPTH_ZERO_SAMPLE_VCF);
+    let err = rsomics_vcf_indv_stats::run_depth(&path).unwrap_err();
+    assert!(
+        err.to_string().contains(DEPTH_REQUIRE_GT_MSG),
+        "unexpected error: {err}"
+    );
+}
+
+/// The binary must exit non-zero and print the message to stderr, not panic,
+/// on a genotype-less depth run.
+#[test]
+fn depth_fail_loud_exit_and_stderr() {
+    for vcf in [DEPTH_SITES_ONLY_VCF, DEPTH_ZERO_SAMPLE_VCF] {
+        let path = write_vcf(vcf);
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rsomics-vcf-indv-stats"))
+            .args(["--mode", "depth"])
+            .arg(&path)
+            .output()
+            .expect("spawn binary");
+        assert!(!out.status.success(), "expected non-zero exit");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(DEPTH_REQUIRE_GT_MSG),
+            "stderr missing require-genotypes message: {stderr}"
+        );
+        assert!(out.stdout.is_empty(), "expected no stdout on fail-loud");
+    }
+}
+
+/// A sample whose FORMAT/DP is missing (`.`) at every site has N_SITES=0;
+/// vcftools prints `nan` for the 0/0 mean. Frozen from vcftools 0.1.17.
+const DEPTH_NAN_VCF: &str = "\
+##fileformat=VCFv4.1\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n\
+chr1\t100\t.\tA\tT\t50\tPASS\t.\tGT:DP\t0/0:10\t0/0:.\n\
+chr1\t200\t.\tG\tC\t60\tPASS\t.\tGT:DP\t0/1:12\t0/1:.\n\
+";
+
+const EXPECTED_DEPTH_NAN: &str = "\
+INDV\tN_SITES\tMEAN_DEPTH\n\
+S1\t2\t11\n\
+S2\t0\tnan\n\
+";
+
+#[test]
+fn depth_zero_sites_prints_nan() {
+    let path = write_vcf(DEPTH_NAN_VCF);
+    let table = rsomics_vcf_indv_stats::run_depth(&path).unwrap();
+    assert_eq!(table.to_text(), EXPECTED_DEPTH_NAN);
+}
+
+/// FORMAT/DP is spec-Integer; vcftools reads it with atoi, so `10.5` truncates
+/// to `10` (mean 8.5, not 8.75). Frozen from vcftools 0.1.17.
+const DEPTH_FLOAT_DP_VCF: &str = "\
+##fileformat=VCFv4.1\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n\
+chr1\t100\t.\tA\tT\t.\t.\t.\tGT:DP\t0/1:10.5\n\
+chr1\t200\t.\tG\tC\t.\t.\t.\tGT:DP\t0/1:7\n\
+";
+
+const EXPECTED_DEPTH_FLOAT_DP: &str = "\
+INDV\tN_SITES\tMEAN_DEPTH\n\
+S1\t2\t8.5\n\
+";
+
+#[test]
+fn depth_dp_truncated_to_integer() {
+    let path = write_vcf(DEPTH_FLOAT_DP_VCF);
+    let table = rsomics_vcf_indv_stats::run_depth(&path).unwrap();
+    assert_eq!(table.to_text(), EXPECTED_DEPTH_FLOAT_DP);
+}
+
+/// Lowercase (soft-masked) biallelic-SNP bases are case-insensitive per the VCF
+/// spec; vcftools folds them before the ACGT classification. Frozen from
+/// vcftools 0.1.17: `a>g` is a transition, `c>t` is a transition → Ts=2.
+const TSTV_LOWERCASE_VCF: &str = "\
+##fileformat=VCFv4.1\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n\
+chr1\t100\t.\ta\tg\t.\t.\t.\tGT\t0/1\n\
+chr1\t200\t.\tc\tt\t.\t.\t.\tGT\t0/1\n\
+";
+
+const EXPECTED_TSTV_LOWERCASE: &str = "\
+MODEL\tCOUNT\n\
+AC\t0\n\
+AG\t1\n\
+AT\t0\n\
+CG\t0\n\
+CT\t1\n\
+GT\t0\n\
+Ts\t2\n\
+Tv\t0\n\
+";
+
+#[test]
+fn tstv_lowercase_bases_are_counted() {
+    let path = write_vcf(TSTV_LOWERCASE_VCF);
+    let stats = rsomics_vcf_indv_stats::run_tstv_summary(&path).unwrap();
+    assert_eq!(stats.to_text(), EXPECTED_TSTV_LOWERCASE);
+}

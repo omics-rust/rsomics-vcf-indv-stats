@@ -147,12 +147,10 @@ pub struct SampleDepth {
 }
 
 impl SampleDepth {
+    /// A sample with no covered site divides 0 by 0; vcftools prints the
+    /// resulting `nan` verbatim, so keep the NaN and let `format_g6` render it.
     fn mean(&self) -> f64 {
-        if self.n_sites == 0 {
-            0.0
-        } else {
-            self.sum_dp / self.n_sites as f64
-        }
+        self.sum_dp / self.n_sites as f64
     }
 }
 
@@ -182,6 +180,9 @@ impl DepthTable {
 /// Format a float with 6 significant figures, matching C `%g` (6 sig-figs, no
 /// trailing zeros, no trailing decimal point).
 pub fn format_g6(x: f64) -> String {
+    if x.is_nan() {
+        return "nan".to_string();
+    }
     if x == 0.0 {
         return "0".to_string();
     }
@@ -247,6 +248,21 @@ mod tests {
     #[test]
     fn format_g6_zero() {
         assert_eq!(format_g6(0.0), "0");
+    }
+
+    #[test]
+    fn format_g6_nan() {
+        assert_eq!(format_g6(f64::NAN), "nan");
+    }
+
+    #[test]
+    fn mean_of_zero_sites_is_nan() {
+        let s = SampleDepth {
+            sample: "X".to_string(),
+            n_sites: 0,
+            sum_dp: 0.0,
+        };
+        assert_eq!(format_g6(s.mean()), "nan");
     }
 
     #[test]

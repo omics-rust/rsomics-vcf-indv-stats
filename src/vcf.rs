@@ -48,6 +48,16 @@ fn require_genotypes_err() -> rsomics_common::RsomicsError {
     )
 }
 
+/// vcftools refuses `--depth` on a genotype-less VCF (0 individuals: a
+/// sites-only header, or a FORMAT column with no sample columns), exiting 1
+/// with this exact core message.
+fn require_genotypes_depth_err() -> rsomics_common::RsomicsError {
+    RsomicsError::InvalidInput(
+        "Require Genotypes in VCF file in order to output Individuals by Mean Depth Statistics."
+            .into(),
+    )
+}
+
 // ── Column indices (0-based after splitting on TAB) ──────────────────────────
 
 const COL_CHROM: usize = 0;
@@ -67,6 +77,30 @@ fn split_cols(line: &str) -> Vec<&str> {
 
 fn is_acgt(b: u8) -> bool {
     matches!(b, b'A' | b'C' | b'G' | b'T')
+}
+
+/// C `atoi`: skip leading blanks, read an optional sign and a run of digits,
+/// stop at the first non-digit. `"10.5"` → `10`, matching how vcftools reads
+/// the spec-Integer FORMAT/DP (truncation toward zero, not float parsing).
+fn atoi(s: &str) -> i64 {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    let mut sign = 1i64;
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        if bytes[i] == b'-' {
+            sign = -1;
+        }
+        i += 1;
+    }
+    let mut val = 0i64;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        val = val * 10 + i64::from(bytes[i] - b'0');
+        i += 1;
+    }
+    sign * val
 }
 
 // ── TsTv summary ─────────────────────────────────────────────────────────────
@@ -97,18 +131,27 @@ pub fn scan_tstv(path: &Path) -> Result<TsTvSummary> {
         }
         let ref_col = cols[COL_REF].as_bytes();
         let alt_col = cols[COL_ALT];
-        // Biallelic SNP only: REF is a single ACGT base, ALT has no comma.
-        if ref_col.len() != 1 || !is_acgt(ref_col[0]) {
+        // Biallelic SNP only: REF is a single base, ALT has no comma. VCF bases
+        // are case-insensitive, so fold to uppercase before the ACGT gate.
+        if ref_col.len() != 1 {
+            continue;
+        }
+        let ref_base = ref_col[0].to_ascii_uppercase();
+        if !is_acgt(ref_base) {
             continue;
         }
         if alt_col.contains(',') {
             continue;
         }
         let alt_bytes = alt_col.as_bytes();
-        if alt_bytes.len() != 1 || !is_acgt(alt_bytes[0]) {
+        if alt_bytes.len() != 1 {
             continue;
         }
-        classify_snp(&mut stats, ref_col[0], alt_bytes[0]);
+        let alt_base = alt_bytes[0].to_ascii_uppercase();
+        if !is_acgt(alt_base) {
+            continue;
+        }
+        classify_snp(&mut stats, ref_base, alt_base);
     }
 
     if !found_chrom {
@@ -283,6 +326,9 @@ pub fn scan_depth(path: &Path) -> Result<DepthTable> {
         if line.starts_with('#') {
             found_chrom = true;
             let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() <= FIRST_SAMPLE {
+                return Err(require_genotypes_depth_err());
+            }
             table.samples = cols[FIRST_SAMPLE..]
                 .iter()
                 .map(|n| SampleDepth {
@@ -295,9 +341,6 @@ pub fn scan_depth(path: &Path) -> Result<DepthTable> {
         }
         if !found_chrom {
             return Err(missing_chrom_err());
-        }
-        if table.samples.is_empty() {
-            continue;
         }
         let cols = split_cols(line);
         if cols.len() <= COL_FORMAT {
@@ -319,12 +362,8 @@ pub fn scan_depth(path: &Path) -> Result<DepthTable> {
             if dp_str == "." {
                 continue;
             }
-            let dp: f64 = match dp_str.parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
             sample_acc.n_sites += 1;
-            sample_acc.sum_dp += dp;
+            sample_acc.sum_dp += atoi(dp_str) as f64;
         }
     }
 

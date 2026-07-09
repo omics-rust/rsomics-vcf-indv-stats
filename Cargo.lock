@@ -241,9 +241,9 @@ dependencies = [
 
 [[package]]
 name = "rsomics-common"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4aa698faaa6684f14349563be86610307e44dd9e7ae7d7865be5c13bcb1533e"
+checksum = "eca772f54099dc5bd5609a9f6947ce2455a9ab17dd9a13d14c0ae9a19ede2018"
 dependencies = [
  "clap",
  "flate2",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "rsomics-vcf-indv-stats"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "flate2",

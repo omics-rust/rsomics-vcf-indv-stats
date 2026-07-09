@@ -12,6 +12,7 @@ pub mod vcf;
 use std::path::Path;
 
 use rsomics_common::Result;
+use rsomics_common::fmt::format_g6;
 use serde::Serialize;
 
 // ── TsTv summary ────────────────────────────────────────────────────────────
@@ -175,24 +176,6 @@ impl DepthTable {
         }
         out
     }
-}
-
-/// Format a float with 6 significant figures, matching C `%g` (6 sig-figs, no
-/// trailing zeros, no trailing decimal point).
-pub fn format_g6(x: f64) -> String {
-    if x.is_nan() {
-        return "nan".to_string();
-    }
-    if x == 0.0 {
-        return "0".to_string();
-    }
-    // Determine how many integer digits the value has so we can compute the
-    // number of decimal places needed for 6 total significant figures.
-    let mag = x.abs().log10().floor() as i32;
-    let dec = (5 - mag).max(0) as usize;
-    let s = format!("{x:.dec$}");
-    let s = s.trim_end_matches('0').trim_end_matches('.');
-    s.to_string()
 }
 
 // ── Public entry points ──────────────────────────────────────────────────────
